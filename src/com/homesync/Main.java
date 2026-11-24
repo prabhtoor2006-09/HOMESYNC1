@@ -1,17 +1,22 @@
 
 package com.homesync;
 
-import java.util.Scanner;
-
-import com.homesync.model.Device;
-import com.homesync.model.Light;
 import com.homesync.model.AC;
+import com.homesync.model.Device;
+import com.homesync.model.EnergyRecord;
 import com.homesync.model.Fan;
-
+import com.homesync.model.Light;
+import com.homesync.service.ActivityLog;
+import com.homesync.service.BackupManager;
+import com.homesync.service.DeviceFactory;
 import com.homesync.service.DeviceManager;
 import com.homesync.service.DeviceReport;
-import com.homesync.service.DeviceFactory;
+import com.homesync.service.DeviceRepository;
+import com.homesync.service.EnergyManager;
+import com.homesync.service.EnergyReport;
 import com.homesync.service.RoomManager;
+import com.homesync.utils.TariffCalculator;
+import java.util.Scanner;
 
 public class Main {
 
@@ -22,6 +27,21 @@ public class Main {
             System.out.print("Try again: ");
         }
         return sc.nextInt();
+    }
+
+    public static double getDecimal(Scanner sc) {
+        while (!sc.hasNextDouble()) {
+            System.out.println("Invalid input! Please enter a number.");
+            sc.next();
+            System.out.print("Try again: ");
+        }
+        return sc.nextDouble();
+    }
+
+    public static void saveAllData(DeviceManager manager, DeviceRepository deviceRepository, EnergyManager energyManager) {
+        deviceRepository.saveAll(manager.getDevices());
+        energyManager.saveToFile();
+        System.out.println("Devices and energy records saved to the data folder.");
     }
 
     public static void addNewDevice(Scanner sc, DeviceManager manager) {
@@ -67,9 +87,21 @@ public class Main {
         DeviceReport report = new DeviceReport();
         RoomManager roomManager = new RoomManager();
 
-        manager.addDevice(new Light(1, "Living Room Light"));
-        manager.addDevice(new AC(2, "Bedroom AC"));
-        manager.addDevice(new Fan(3, "Ceiling Fan"));
+        DeviceRepository deviceRepository = new DeviceRepository();
+        EnergyManager energyManager = new EnergyManager();
+        TariffCalculator tariffCalculator = new TariffCalculator();
+        EnergyReport energyReport = new EnergyReport(energyManager, tariffCalculator);
+        BackupManager backupManager = new BackupManager();
+        ActivityLog activityLog = ActivityLog.getInstance();
+
+        // Load saved devices; on the very first run use the sample devices.
+        if (deviceRepository.restoreInto(manager) == 0) {
+            manager.addDevice(new Light(1, "Living Room Light"));
+            manager.addDevice(new AC(2, "Bedroom AC"));
+            manager.addDevice(new Fan(3, "Ceiling Fan"));
+        }
+        energyManager.loadFromFile();
+        backupManager.startAutoBackup(5 * 60 * 1000);   // background thread: backup every 5 minutes
 
         int choice;
 
@@ -86,7 +118,17 @@ public class Main {
             System.out.println("9. Add Room");
             System.out.println("10. Assign Device to Room");
             System.out.println("11. View Rooms");
-            System.out.println("12. Exit");
+            System.out.println("12. Record Energy Usage");
+            System.out.println("13. Energy Report");
+            System.out.println("14. Set Electricity Tariff");
+            System.out.println("15. Start Live Energy Monitor (thread)");
+            System.out.println("16. Stop Live Energy Monitor");
+            System.out.println("17. Create Backup");
+            System.out.println("18. Restore Latest Backup");
+            System.out.println("19. View Activity Log");
+            System.out.println("20. Thread Demo (race condition)");
+            System.out.println("21. Save All Data");
+            System.out.println("22. Exit");
 
             System.out.print("Enter your choice: ");
             choice = getNumber(sc);
@@ -99,12 +141,22 @@ public class Main {
 
                 case 2:
                     System.out.print("Enter Device ID: ");
-                    manager.turnDeviceOn(getNumber(sc));
+                    int onId = getNumber(sc);
+                    Device onDevice = manager.searchDevice(onId);
+                    manager.turnDeviceOn(onId);
+                    if (onDevice != null) {
+                        activityLog.logDeviceOn(onId, onDevice.getDeviceName());
+                    }
                     break;
 
                 case 3:
                     System.out.print("Enter Device ID: ");
-                    manager.turnDeviceOff(getNumber(sc));
+                    int offId = getNumber(sc);
+                    Device offDevice = manager.searchDevice(offId);
+                    manager.turnDeviceOff(offId);
+                    if (offDevice != null) {
+                        activityLog.logDeviceOff(offId, offDevice.getDeviceName());
+                    }
                     break;
 
                 case 4:
@@ -123,8 +175,12 @@ public class Main {
                 case 5:
                     System.out.print("Enter Device ID: ");
                     int removeId = getNumber(sc);
+                    boolean existed = manager.searchDevice(removeId) != null;
                     manager.removeDevice(removeId);
                     roomManager.removeDeviceFromRooms(removeId);
+                    if (existed) {
+                        activityLog.logDeviceRemoved(removeId);
+                    }
                     break;
 
                 case 6:
@@ -136,7 +192,12 @@ public class Main {
                     break;
 
                 case 8:
+                    int countBefore = manager.getDevices().size();
                     addNewDevice(sc, manager);
+                    if (manager.getDevices().size() > countBefore) {
+                        Device added = manager.getDevices().get(manager.getDevices().size() - 1);
+                        activityLog.logDeviceAdded(added.getDeviceId(), added.getDeviceName());
+                    }
                     break;
 
                 case 9:
@@ -167,6 +228,90 @@ public class Main {
                     break;
 
                 case 12:
+                    System.out.print("Enter Device ID: ");
+                    Device usedDevice = manager.searchDevice(getNumber(sc));
+                    if (usedDevice == null) {
+                        System.out.println("Device not found.");
+                    } else {
+                        System.out.print("Enter usage in hours: ");
+                        double hours = getDecimal(sc);
+                        try {
+                            double watts = energyManager.getPowerRating(usedDevice);
+                            energyManager.recordUsage(usedDevice, hours);
+                            tariffCalculator.displayCalculation(EnergyRecord.calculateKwh(watts, hours));
+                        } catch (IllegalArgumentException e) {
+                            System.out.println("Could not record usage: " + e.getMessage());
+                        }
+                    }
+                    break;
+
+                case 13:
+                    energyReport.displayReport();
+                    break;
+
+                case 14:
+                    System.out.print("Enter tariff per kWh (Rs.): ");
+                    double newTariff = getDecimal(sc);
+                    try {
+                        tariffCalculator.setTariffPerKwh(newTariff);
+                        System.out.println("Tariff set to Rs. " + newTariff + " per kWh.");
+                    } catch (IllegalArgumentException e) {
+                        System.out.println(e.getMessage());
+                    }
+                    break;
+
+                case 15:
+                    if (energyManager.startMonitoring(manager)) {
+                        System.out.println("Energy monitor started (thread state: "
+                                + energyManager.getMonitorState() + ").");
+                        System.out.println("It records usage of every ON device every "
+                                + EnergyManager.DEFAULT_INTERVAL_MILLIS / 1000 + " seconds.");
+                    } else {
+                        System.out.println("Energy monitor is already running.");
+                    }
+                    break;
+
+                case 16:
+                    if (energyManager.stopMonitoring()) {
+                        System.out.println("Energy monitor stopped after "
+                                + energyManager.getMonitorTicks() + " tick(s).");
+                    } else {
+                        System.out.println("Energy monitor is not running.");
+                    }
+                    break;
+
+                case 17:
+                    String backupName = backupManager.createBackup();
+                    System.out.println(backupName == null
+                            ? "Nothing to back up yet. Use option 21 to save data first."
+                            : "Backup created: " + backupName);
+                    break;
+
+                case 18:
+                    if (backupManager.restoreLatestBackup()) {
+                        manager.getDevices().clear();
+                        deviceRepository.restoreInto(manager);
+                        energyManager.loadFromFile();
+                        System.out.println("Devices and energy records reloaded from the backup.");
+                    }
+                    break;
+
+                case 19:
+                    activityLog.displayRecent(10);
+                    break;
+
+                case 20:
+                    energyManager.demonstrateRaceCondition();
+                    break;
+
+                case 21:
+                    saveAllData(manager, deviceRepository, energyManager);
+                    break;
+
+                case 22:
+                    energyManager.stopMonitoring();
+                    backupManager.stopAutoBackup();
+                    saveAllData(manager, deviceRepository, energyManager);
                     System.out.println("Thank you for using HOMESYNC!");
                     break;
 
@@ -174,7 +319,7 @@ public class Main {
                     System.out.println("Invalid choice. Try again.");
             }
 
-        } while (choice != 12);
+        } while (choice != 22);
 
         sc.close();
     }

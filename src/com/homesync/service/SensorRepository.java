@@ -3,41 +3,35 @@ package com.homesync.service;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 
+import com.homesync.model.BrightnessSensor;
+import com.homesync.model.MotionSensor;
+import com.homesync.model.Sensor;
+import com.homesync.model.TemperatureSensor;
 import com.homesync.utils.FileManager;
+import com.homesync.utils.SensorValidator;
 
 /**
- * SensorRepository - saves and loads sensor records.
+ * SensorRepository - saves and loads Anshul's EXISTING Sensor objects.
  *
- * INTEGRATION CONTRACT (Anshul's Sensor classes were not in the repository
- * when this was written, so NO Sensor class is used or duplicated here):
+ * File   : data/sensors.csv
+ * Format : id,type,name,room,reading,active,lastSaved          (7 fields)
+ * Example: 1,TemperatureSensor,Hall Thermostat,Hall,29.5,true,2026-11-25T14:03:22
  *
- *   File   : data/sensors.csv
- *   Format : id,name,type,reading,lastUpdated        (5 fields)
- *   Example: 1,Hall Thermostat,Temperature,29.5,2026-11-25T14:03:22
+ * "type" is the class name (TemperatureSensor, MotionSensor, BrightnessSensor).
+ * On loading, the matching Anshul class is created with its own constructor,
+ * then setCurrentReading() and setActive() restore the saved values.
+ * No new Sensor class is created here.
  *
- *   Sensor module calls (all values come from Anshul's Sensor getters):
- *     saveSensor(int id, String name, String type, double reading)  -> boolean
- *     updateReading(int id, double newReading)                      -> boolean
- *     findSensor(int id)                                            -> String[] or null
- *     loadSensors()                                                 -> List<String[]>
- *     searchSensors(String keyword)                                 -> List<String[]>
- *     deleteSensor(int id)                                          -> boolean
- *
- *   Each String[] uses the INDEX_ constants below (INDEX_ID, INDEX_NAME, ...).
- *   Once Anshul's Sensor class exists, a one-line overload such as
- *   saveSensor(Sensor s) can call saveSensor(s.getId(), s.getName(), ...).
+ * Known limitation: MotionSensor keeps its "motionDetected" flag private with
+ * no setter, so after loading, isMotionDetected() is false until the next
+ * updateReading(). The saved numeric reading (1 or 0) is still restored.
  */
 public class SensorRepository {
 
-    public static final int INDEX_ID = 0;
-    public static final int INDEX_NAME = 1;
-    public static final int INDEX_TYPE = 2;
-    public static final int INDEX_READING = 3;
-    public static final int INDEX_UPDATED = 4;
-
-    private static final int FIELD_COUNT = 5;
+    private static final int FIELD_COUNT = 7;
 
     private final String filePath;
 
@@ -49,103 +43,155 @@ public class SensorRepository {
         this.filePath = filePath;
     }
 
-    /** Saves a sensor: updates it if the ID exists, otherwise appends it. */
-    public boolean saveSensor(int id, String name, String type, double reading) {
-        if (id <= 0 || isBlank(name) || isBlank(type)) {
-            System.out.println("Invalid sensor: ID must be positive, name and type are required.");
+    // ---------------------------------------------------------------- SAVE
+
+    /** Saves one sensor: updates its line if the ID exists, otherwise appends. */
+    public boolean saveSensor(Sensor sensor) {
+        if (sensor == null || !SensorValidator.isValidId(sensor.getSensorId())) {
             return false;
         }
-
-        String line = buildLine(id, name, type, reading);
-        String key = String.valueOf(id);
+        String line = toLine(sensor);
+        String key = String.valueOf(sensor.getSensorId());
 
         if (FileManager.containsKey(filePath, key)) {
-            return FileManager.updateLine(filePath, key, line);
+            return FileManager.updateLine(filePath, key, line);   // no duplicate IDs
         }
         return FileManager.appendLine(filePath, line);
     }
 
-    /** Loads all valid sensors; invalid lines are skipped. */
-    public List<String[]> loadSensors() {
-        List<String[]> sensors = new ArrayList<>();
+    /** Replaces the whole file with the given sensors (removed sensors disappear). */
+    public boolean saveAll(ArrayList<Sensor> sensors) {
+        ArrayList<String> lines = new ArrayList<>();
+        for (Sensor sensor : sensors) {
+            lines.add(toLine(sensor));
+        }
+        return FileManager.writeLines(filePath, lines);
+    }
+
+    // ---------------------------------------------------------------- LOAD
+
+    /** Loads every valid sensor. Invalid or duplicate lines are skipped. */
+    public ArrayList<Sensor> loadSensors() {
+        ArrayList<Sensor> sensors = new ArrayList<>();
+        Set<Integer> usedIds = new HashSet<>();
         int skipped = 0;
 
         for (String line : FileManager.readLines(filePath)) {
-            if (isValidSensorLine(line)) {
-                sensors.add(FileManager.splitFields(line));
-            } else {
+            Sensor sensor = parseSensor(line);
+            if (sensor == null || !usedIds.add(sensor.getSensorId())) {
                 skipped++;
+            } else {
+                sensors.add(sensor);
             }
         }
 
         if (skipped > 0) {
-            System.out.println("Sensor file: skipped " + skipped + " invalid record(s).");
+            System.out.println("Sensor file: skipped " + skipped + " invalid or duplicate record(s).");
         }
         return sensors;
     }
 
-    public String[] findSensor(int id) {
-        String line = FileManager.findLine(filePath, String.valueOf(id));
-        return (line != null && isValidSensorLine(line)) ? FileManager.splitFields(line) : null;
+    /** Puts saved sensors into a SensorManager (IDs already there are not added again). */
+    public int restoreInto(SensorManager manager) {
+        int restored = 0;
+        for (Sensor sensor : loadSensors()) {
+            if (manager.searchSensor(sensor.getSensorId()) == null) {
+                manager.addSensor(sensor);
+                restored++;
+            }
+        }
+        return restored;
     }
 
-    public List<String[]> searchSensors(String keyword) {
-        List<String[]> matches = new ArrayList<>();
+    // -------------------------------------------------------------- SEARCH
+
+    public Sensor findSensor(int sensorId) {
+        String line = FileManager.findLine(filePath, String.valueOf(sensorId));
+        return (line == null) ? null : parseSensor(line);
+    }
+
+    /** Sensors whose saved line contains the keyword (name, room, type ...). */
+    public ArrayList<Sensor> searchSensors(String keyword) {
+        ArrayList<Sensor> matches = new ArrayList<>();
         for (String line : FileManager.searchLines(filePath, keyword)) {
-            if (isValidSensorLine(line)) {
-                matches.add(FileManager.splitFields(line));
+            Sensor sensor = parseSensor(line);
+            if (sensor != null) {
+                matches.add(sensor);
             }
         }
         return matches;
     }
 
-    /** Changes only the reading (and time) of an existing sensor. */
-    public boolean updateReading(int id, double newReading) {
-        String[] sensor = findSensor(id);
-        if (sensor == null) {
+    // ------------------------------------------------------ UPDATE / DELETE
+
+    public boolean updateSensor(Sensor sensor) {
+        return FileManager.updateLine(filePath, String.valueOf(sensor.getSensorId()), toLine(sensor));
+    }
+
+    /** Changes only the saved reading of one sensor. */
+    public boolean updateReading(int sensorId, double newReading) {
+        Sensor sensor = findSensor(sensorId);
+        if (sensor == null || !Double.isFinite(newReading)) {
             return false;
         }
-        return FileManager.updateLine(filePath, String.valueOf(id),
-                buildLine(id, sensor[INDEX_NAME], sensor[INDEX_TYPE], newReading));
+        sensor.setCurrentReading(newReading);
+        return updateSensor(sensor);
     }
 
-    public boolean deleteSensor(int id) {
-        return FileManager.deleteLine(filePath, String.valueOf(id));
+    public boolean deleteSensor(int sensorId) {
+        return FileManager.deleteLine(filePath, String.valueOf(sensorId));
     }
 
-    public void displaySensors() {
-        List<String[]> sensors = loadSensors();
-        System.out.println("\n===== SAVED SENSORS =====");
-        if (sensors.isEmpty()) {
-            System.out.println("No sensors saved.");
-            return;
-        }
-        for (String[] s : sensors) {
-            System.out.println("Sensor " + s[INDEX_ID] + " | " + s[INDEX_NAME] + " | " + s[INDEX_TYPE]
-                    + " | reading " + s[INDEX_READING] + " | updated " + s[INDEX_UPDATED]);
-        }
+    public int countSavedSensors() {
+        return FileManager.countLines(filePath);
     }
 
     // ------------------------------------------------------------- HELPERS
 
-    private String buildLine(int id, String name, String type, double reading) {
+    private String toLine(Sensor sensor) {
         String time = LocalDateTime.now().withNano(0).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
-        return id + "," + FileManager.cleanText(name) + "," + FileManager.cleanText(type) + "," + reading + "," + time;
+        return sensor.getSensorId() + "," + sensor.getClass().getSimpleName() + ","
+                + FileManager.cleanText(sensor.getSensorName()) + ","
+                + FileManager.cleanText(sensor.getRoomName()) + ","
+                + sensor.getCurrentReading() + "," + sensor.isActive() + "," + time;
     }
 
-    private boolean isValidSensorLine(String line) {
+    /** Returns null when the line is invalid. */
+    private Sensor parseSensor(String line) {
         if (!FileManager.isValidRecord(line, FIELD_COUNT)) {
-            return false;
+            return null;
         }
-        String[] fields = FileManager.splitFields(line);
-        try {
-            return Integer.parseInt(fields[INDEX_ID]) > 0 && !Double.isNaN(Double.parseDouble(fields[INDEX_READING]));
-        } catch (NumberFormatException e) {
-            return false;
-        }
-    }
 
-    private boolean isBlank(String text) {
-        return text == null || text.trim().isEmpty();
+        String[] fields = FileManager.splitFields(line);
+        int id;
+        double reading;
+        try {
+            id = Integer.parseInt(fields[0]);
+            reading = Double.parseDouble(fields[4]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (!SensorValidator.isValidId(id) || !Double.isFinite(reading)) {
+            return null;
+        }
+
+        Sensor sensor;
+        switch (fields[1]) {
+            case "TemperatureSensor":
+                sensor = new TemperatureSensor(id, fields[2], fields[3]);
+                break;
+            case "MotionSensor":
+                sensor = new MotionSensor(id, fields[2], fields[3]);
+                break;
+            case "BrightnessSensor":
+                sensor = new BrightnessSensor(id, fields[2], fields[3]);
+                break;
+            default:
+                return null;      // unknown sensor type
+        }
+
+        sensor.setCurrentReading(reading);
+        sensor.setActive(fields[5].equalsIgnoreCase("true"));
+        return sensor;
     }
 }
